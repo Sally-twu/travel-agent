@@ -31,25 +31,30 @@ from datetime import date, datetime, timezone
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+# 重用 overseas_medical 的地理編碼、DynamoDB 查詢、營業時間與距離計算等函式。
 import overseas_medical as medical
 
 
 LOGGER = logging.getLogger()
 LOGGER.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
+# 工具回應 envelope 的版本、資料來源標示，以及輸入長度上限。
 SCHEMA_VERSION = "2.0"
 SOURCE_SYSTEM = "clinic_service"
 MAX_LOCATION_LENGTH = 200
 MAX_SYMPTOMS_LENGTH = 500
 
+# 允許的輸入欄位、支援的語言代碼、對外輸出的科別代碼。
 ALLOWED_INPUT_KEYS = {"location", "symptoms", "language"}
 LANGUAGE_CODES = {"zh", "en", "ja", "ko"}
 SPECIALTY_CODES = ("general", "internal_medicine", "emergency", "other")
 
+# 分流結果：一般門診／住院或重症。
 ROUTE_GENERAL = "GENERAL_OUTPATIENT"
 ROUTE_SEVERE = "HOSPITALIZATION_OR_SEVERE"
 
 # Severe keywords always win over general keywords.
+# 重症關鍵字：命中任一個就走 HOSPITALIZATION_OR_SEVERE 路線（優先於一般關鍵字）。
 SEVERE_KEYWORDS = (
     "住院",
     "重大",
@@ -87,6 +92,7 @@ SEVERE_KEYWORDS = (
 )
 
 # Keyword -> specialty for the general outpatient route.
+# 一般門診關鍵字 → 對應科別（目前都對應內科）。
 GENERAL_KEYWORDS: dict[str, str] = {
     "發燒": "internal_medicine",
     "發熱": "internal_medicine",
@@ -112,15 +118,20 @@ GENERAL_KEYWORDS: dict[str, str] = {
     "vomit": "internal_medicine",
 }
 
+# 重症時提供的國泰產險 24 小時海外急難救助專線。
 EMERGENCY_ASSISTANCE = {
     "provider": "國泰產險 24 小時海外急難救助",
     "phone": "+886-2-2755-1258",
 }
 
+# 各國當地緊急電話（依 countryCode）；未列出的國家回傳 None。
 LOCAL_EMERGENCY_NUMBERS = {"JP": "119", "KR": "119", "US": "911", "CA": "911", "GB": "999"}
 
 # Versioned advance-payment (代墊) rule. Any change must bump ``version`` and
 # be reviewed by the product, claims and compliance owners.
+# 代墊（醫療費用由救援公司先行墊付）資格規則：
+# 國泰產險海外旅平險、意外醫療與海外突發疾病醫療保額皆 ≥ 120 萬 TWD、
+# 需附加旅遊不便險，且僅限日本／韓國。
 ADVANCE_PAYMENT_RULE: dict[str, Any] = {
     "version": "2026-11-14",
     "insurer": "CATHAY_CENTURY",
@@ -135,15 +146,19 @@ ADVANCE_PAYMENT_RULE: dict[str, Any] = {
     "partner": "聯合國際救援公司",
 }
 
+# 重症回應中 Agent 必須原文顯示的最終確認聲明。
 FINAL_CONFIRMATION_NOTICE = "由急難救助合作夥伴與當地醫院最終確認"
 
+# 代墊資格判斷結果：初步符合／不符合／無法判斷（缺身分或保單服務失敗）。
 STATUS_ELIGIBLE = "PRELIMINARILY_ELIGIBLE"
 STATUS_NOT_ELIGIBLE = "NOT_ELIGIBLE"
 STATUS_UNDETERMINED = "UNDETERMINED"
 
+# 不可輸出的內部欄位（第二道防線；第一道是 overseas_medical 的 ProjectionExpression）。
 NON_PUBLIC_FIELDS = {"internalContact", "contractRate", "internalNote", "notes"}
 
 
+# 工具錯誤：code、可顯示的訊息、retryable（呼叫端是否可重試）。
 class ToolError(Exception):
     def __init__(self, code: str, message: str, retryable: bool = False) -> None:
         super().__init__(message)
@@ -155,14 +170,17 @@ class ToolError(Exception):
 # --------------------------------------------------------------------------- #
 # Envelope
 # --------------------------------------------------------------------------- #
+# 目前 UTC 時間（獨立成函式，方便測試時替換）。
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# 轉成 RFC 3339 UTC 字串，例如 2026-11-14T08:00:00Z。
 def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+# envelope 的 source 區塊：來源系統、是否為模擬資料（DATA_IS_MOCK）、取得時間。
 def _source(retrieved_at: datetime) -> dict[str, Any]:
     return {
         "system": SOURCE_SYSTEM,
@@ -171,6 +189,7 @@ def _source(retrieved_at: datetime) -> dict[str, Any]:
     }
 
 
+# 成功 envelope：status=success、data 有值、error=None。
 def _success(data: dict[str, Any], retrieved_at: datetime) -> dict[str, Any]:
     return {
         "schemaVersion": SCHEMA_VERSION,
@@ -181,6 +200,7 @@ def _success(data: dict[str, Any], retrieved_at: datetime) -> dict[str, Any]:
     }
 
 
+# 失敗 envelope：status=error、data=None、error 帶 code / message / retryable。
 def _error(exc: ToolError, retrieved_at: datetime) -> dict[str, Any]:
     return {
         "schemaVersion": SCHEMA_VERSION,
@@ -194,6 +214,8 @@ def _error(exc: ToolError, retrieved_at: datetime) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Input & triage
 # --------------------------------------------------------------------------- #
+# 驗證工具輸入：只允許 location、symptoms、language。
+# location ≤ 200 字、symptoms ≤ 500 字，且都不可空白；language 為 zh / en / ja / ko / any（預設 any）。
 def _parse_input(event: Any) -> dict[str, Any]:
     if not isinstance(event, dict):
         raise ToolError("INVALID_ARGUMENT", "工具輸入必須是 JSON 物件")
@@ -224,6 +246,9 @@ def _parse_input(event: Any) -> dict[str, Any]:
     return {"location": location, "symptoms": symptoms, "language": language}
 
 
+# 症狀分流（純關鍵字，不呼叫 LLM）：
+# 命中重症字 → SEVERE，specialty=emergency；
+# 否則 → GENERAL，specialty 取第一個命中的一般關鍵字對應科別，都沒命中則為 general。
 def triage(symptoms: str) -> dict[str, Any]:
     """Classify symptoms by keyword. Severe keywords take precedence."""
     lowered = symptoms.casefold()
@@ -238,6 +263,7 @@ def triage(symptoms: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Facility helpers
 # --------------------------------------------------------------------------- #
+# 營業狀態三態：OPEN / CLOSED / UNKNOWN（時區或營業時間資料缺漏時為 UNKNOWN，而不是直接當作關閉）。
 def _opening_status(facility: dict[str, Any], now_utc: datetime) -> str:
     if facility.get("emergency24h") is True:
         return "OPEN"
@@ -251,6 +277,7 @@ def _opening_status(facility: dict[str, Any], now_utc: datetime) -> str:
     return "OPEN" if medical._is_open(facility, now_utc) else "CLOSED"
 
 
+# 合作是否有效：active=True 且 partnershipStatus=ACTIVE；validUntil 未設定視為無期限，過期或格式錯誤則無效。
 def _is_valid_partner(facility: dict[str, Any], today: date) -> bool:
     if facility.get("active") is not True or facility.get("partnershipStatus") != "ACTIVE":
         return False
@@ -263,6 +290,7 @@ def _is_valid_partner(facility: dict[str, Any], today: date) -> bool:
         return False  # Fail closed on malformed validity.
 
 
+# 取出並驗證院所經緯度；無效時回傳 None。
 def _coordinates(facility: dict[str, Any]) -> tuple[float, float] | None:
     try:
         lat, lon = float(facility["latitude"]), float(facility["longitude"])
@@ -273,10 +301,12 @@ def _coordinates(facility: dict[str, Any]) -> tuple[float, float] | None:
     return lat, lon
 
 
+# 安全取出字串清單：不是 list 就回傳空清單，並過濾掉非字串元素。
 def _list_of_str(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
 
 
+# 是否能處理重症：facilityType=hospital、24 小時急診，或 services 包含 emergency。
 def _is_hospital(facility: dict[str, Any]) -> bool:
     services = _list_of_str(facility.get("services"))
     return (
@@ -286,6 +316,7 @@ def _is_hospital(facility: dict[str, Any]) -> bool:
     )
 
 
+# 科別比對：general 需求接受一般科或內科院所；特定科別接受該科或一般科院所。
 def _matches_specialty(facility: dict[str, Any], specialty: str) -> bool:
     services = _list_of_str(facility.get("services"))
     if specialty == "general":
@@ -294,6 +325,8 @@ def _matches_specialty(facility: dict[str, Any], specialty: str) -> bool:
     return specialty in services or "general" in services
 
 
+# 產生候選院所：合作有效 + 座標有效 + 在搜尋半徑內。
+# 移除非公開欄位，並附上內部用的 _distanceKm、_openingStatus（底線開頭，輸出前會轉換）。
 def _candidates(
     facilities: Iterable[dict[str, Any]],
     latitude: float,
@@ -319,6 +352,8 @@ def _candidates(
     return results
 
 
+# 轉成對外輸出的 clinic 物件（schema 2.0）；語言與科別只保留白名單代碼。
+# advance_flag：該院所是否可協調代墊（None 表示不適用）。
 def _public_clinic(item: dict[str, Any], advance_flag: bool | None) -> dict[str, Any]:
     languages = [code for code in _list_of_str(item.get("languages")) if code in LANGUAGE_CODES]
     specialties = [code for code in _list_of_str(item.get("services")) if code in SPECIALTY_CODES]
@@ -337,10 +372,12 @@ def _public_clinic(item: dict[str, Any], advance_flag: bool | None) -> dict[str,
     return clinic
 
 
+# 回傳筆數上限（MAX_RESULTS，範圍 1~10）。
 def _max_results() -> int:
     return medical._env_int("MAX_RESULTS", medical.DEFAULT_MAX_RESULTS, 1, 10)
 
 
+# 一般門診：科別符合、不是確定關閉（UNKNOWN 仍保留）、語言符合，依距離排序取前 N 筆。
 def general_clinics(
     candidates: list[dict[str, Any]], specialty: str, language: str
 ) -> list[dict[str, Any]]:
@@ -355,6 +392,9 @@ def general_clinics(
     return [_public_clinic(item, None) for item in selected[: _max_results()]]
 
 
+# 重症：只挑醫院／急診院所，並比對語言。
+# 代墊初步符合 → 支援第三方直接帳單（thirdPartyDirectBilling）的醫院優先，再依距離；
+# 否則只依距離排序，且不標示代墊。
 def severe_hospitals(
     candidates: list[dict[str, Any]], language: str, eligible: bool
 ) -> list[dict[str, Any]]:
@@ -378,6 +418,8 @@ def severe_hospitals(
 # --------------------------------------------------------------------------- #
 # Identity, policy service and versioned rule
 # --------------------------------------------------------------------------- #
+# 只從可信的呼叫 context（client_context.custom[TRUSTED_IDENTITY_CONTEXT_KEY]）取得使用者 ID；
+# 絕不採用工具輸入；未設定 key 時回傳 None。
 def trusted_user_id(context: Any) -> str | None:
     """Read the user id only from the trusted invocation context.
 
@@ -396,6 +438,8 @@ def trusted_user_id(context: Any) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+# 同步呼叫保單服務 Lambda（POLICY_SERVICE_FUNCTION）取得使用者保單；
+# 相容 API Gateway 格式（body 為字串）；任何錯誤或格式不符都會拋出例外。
 def fetch_policies(user_id: str) -> list[dict[str, Any]]:
     """Call the policy service Lambda. Raises on any downstream failure."""
     function_name = os.getenv("POLICY_SERVICE_FUNCTION", "").strip()
@@ -418,6 +462,7 @@ def fetch_policies(user_id: str) -> list[dict[str, Any]]:
     return [policy for policy in policies if isinstance(policy, dict)]
 
 
+# 保額轉成 float；無法解析視為 0（低於門檻，fail-closed）。
 def _amount(value: Any) -> float:
     try:
         return float(value)
@@ -425,6 +470,7 @@ def _amount(value: Any) -> float:
         return 0.0
 
 
+# 保單是否生效：status=ACTIVE，且今天介於 coverageStart 與 coverageEnd 之間。
 def _policy_in_force(policy: dict[str, Any], today: date) -> bool:
     if policy.get("status") != "ACTIVE":
         return False
@@ -436,6 +482,11 @@ def _policy_in_force(policy: dict[str, Any], today: date) -> bool:
     return start <= today <= end
 
 
+# 依 ADVANCE_PAYMENT_RULE 評估代墊資格：
+# - 國家不在 JP / KR → 不符合
+# - 沒有生效中的國泰旅平險 → 不符合
+# - 任一張保單同時符合幣別、兩項保額門檻與必要附約 → 初步符合
+# - 否則彙整所有保單的不符原因
 def evaluate_advance_payment(
     policies: list[dict[str, Any]], country_code: str | None, today: date
 ) -> dict[str, Any]:
@@ -475,6 +526,8 @@ def evaluate_advance_payment(
     return {"status": STATUS_NOT_ELIGIBLE, "reasons": sorted(reasons)}
 
 
+# 組合代墊資訊：規則版本、合作救援公司、需醫院同意等固定欄位 + 評估結果。
+# 沒有可信身分或保單服務失敗 → UNDETERMINED，絕不因此阻擋急難指引。
 def _advance_payment(context: Any, country_code: str | None, today: date) -> dict[str, Any]:
     rule = ADVANCE_PAYMENT_RULE
     base = {
@@ -497,10 +550,13 @@ def _advance_payment(context: Any, country_code: str | None, today: date) -> dic
 # --------------------------------------------------------------------------- #
 # Handler
 # --------------------------------------------------------------------------- #
+# 追蹤用 request ID：Lambda aws_request_id，否則隨機 UUID。
 def _request_id(context: Any) -> str:
     return str(getattr(context, "aws_request_id", None) or uuid.uuid4())
 
 
+# 一般門診流程：地理編碼 → 查詢該國院所 → 篩選候選 → 依科別與語言挑選最近的院所。
+# 地點無法解析或查無院所時回傳 NOT_FOUND 錯誤。
 def _handle_general(request: dict[str, Any], triaged: dict[str, Any], now_utc: datetime) -> dict[str, Any]:
     geocoded = medical._geocode(request["location"])
     if not geocoded or not geocoded.get("countryCode"):
@@ -525,6 +581,8 @@ def _handle_general(request: dict[str, Any], triaged: dict[str, Any], now_utc: d
     }
 
 
+# 重症流程：一定回傳急難救助專線與代墊資訊。
+# 地理編碼或院所查詢失敗只記 warning，不影響急難指引（此時 clinics 可能是空陣列）。
 def _handle_severe(
     request: dict[str, Any], triaged: dict[str, Any], context: Any, now_utc: datetime
 ) -> dict[str, Any]:
@@ -567,6 +625,8 @@ def _handle_severe(
     }
 
 
+# Lambda 入口（AgentCore Gateway Target）：驗證輸入 → 症狀分流 → 一般／重症流程 → 回傳 schema 2.0 envelope。
+# log 只記錄路線、國家、筆數與代墊狀態，不記錄症狀、地點或保單內容。
 def lambda_handler(event: Any, context: Any) -> dict[str, Any]:
     """Return the get-clinic-info v2.0 envelope as a JSON-serialisable dict."""
     now_utc = _now_utc()
@@ -587,15 +647,19 @@ def lambda_handler(event: Any, context: Any) -> dict[str, Any]:
             (data.get("advancePayment") or {}).get("status"),
         )
         return _success(data, now_utc)
+    # 預期錯誤（輸入錯誤、查無結果）：回傳不可重試的錯誤 envelope。
     except ToolError as exc:
         LOGGER.info("clinic_tool request_id=%s outcome=error code=%s", request_id, exc.code)
         return _error(exc, now_utc)
+    # 非預期錯誤：只記錄錯誤代碼，回傳可重試的 SERVICE_UNAVAILABLE。
     except Exception as exc:
         error_response = getattr(exc, "response", None)
         error_object = error_response.get("Error", {}) if isinstance(error_response, dict) else {}
+        # operation 為 botocore 的 API 名稱（如 Geocode、Query），方便判斷是哪個 IAM 權限不足。
         LOGGER.error(
-            "clinic_tool request_id=%s outcome=failed error_code=%s",
+            "clinic_tool request_id=%s outcome=failed operation=%s error_code=%s",
             request_id,
+            str(getattr(exc, "operation_name", None) or "local"),
             str(error_object.get("Code") or type(exc).__name__),
         )
         return _error(

@@ -27,14 +27,17 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
+# CloudWatch Logs 設定；可用 LOG_LEVEL 環境變數調整。正式環境維持 INFO，避免記錄使用者輸入內容。
 LOGGER = logging.getLogger()
 LOGGER.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
+# 輸入與查詢限制：text 字數上限、request body 位元組上限、預設搜尋半徑（公里）、預設回傳筆數。
 MAX_TEXT_LENGTH = 2_000
 MAX_BODY_BYTES = 16_384
 DEFAULT_RADIUS_KM = 50.0
 DEFAULT_MAX_RESULTS = 3
 
+# 高風險症狀關鍵字（中英文）。命中即走急症流程：直接提示撥打當地緊急電話，不推薦一般院所。
 EMERGENCY_TERMS = (
     "無法呼吸",
     "呼吸困難",
@@ -53,10 +56,13 @@ EMERGENCY_TERMS = (
     "chest pain",
     "stroke",
 )
+# 否定語句：使用者明確表示「不是急症」時，不觸發急症流程。
 EMERGENCY_NEGATIONS = ("不是急症", "非急症", "沒有胸痛", "no emergency")
 
+# 對應 datetime.weekday() 的索引（0 = 星期一），也是 DynamoDB hours 欄位的 key。
 DAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
+# DynamoDB 允許讀取的欄位白名單；合約、價格、聯絡人、備註等內部欄位永遠不會被讀進此函式。
 # ProjectionExpression is a deliberate output-data boundary. Internal contract,
 # pricing, contact-person and note fields are never read into this function.
 PUBLIC_FACILITY_FIELDS = (
@@ -81,6 +87,7 @@ PUBLIC_FACILITY_FIELDS = (
 )
 
 
+# 可安全回傳給呼叫端的驗證錯誤（code、訊息、HTTP 狀態碼），不含任何內部資訊。
 class RequestError(Exception):
     """A safe validation error that may be returned to the caller."""
 
@@ -91,6 +98,7 @@ class RequestError(Exception):
         self.status_code = status_code
 
 
+# 讀取布林環境變數；"1/true/yes/on" 視為 True，未設定時回傳預設值。
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -98,6 +106,7 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# 讀取整數環境變數並限制在 [minimum, maximum]；格式錯誤時回傳預設值，避免錯誤設定造成過量查詢。
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
         value = int(os.getenv(name, str(default)))
@@ -106,6 +115,7 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return min(max(value, minimum), maximum)
 
 
+# 同上，浮點數版本（例如 SEARCH_RADIUS_KM）。
 def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
     try:
         value = float(os.getenv(name, str(default)))
@@ -114,6 +124,7 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
     return min(max(value, minimum), maximum)
 
 
+# 延遲建立 boto3 client：真正呼叫 AWS 時才 import，讓純函式可在沒有 AWS 憑證時測試。
 def _aws_client(service: str):
     # boto3 is intentionally imported lazily. It is supplied by AWS Lambda.
     import boto3  # type: ignore
@@ -121,6 +132,7 @@ def _aws_client(service: str):
     return boto3.client(service, region_name=os.getenv("AWS_REGION"))
 
 
+# 組成 API Gateway Proxy 回應：JSON body + no-store / nosniff 安全標頭；有設定 ALLOWED_ORIGIN 才加 CORS 標頭。
 def _response(status_code: int, payload: dict[str, Any]) -> dict[str, Any]:
     headers = {
         "content-type": "application/json; charset=utf-8",
@@ -137,6 +149,7 @@ def _response(status_code: int, payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# 取得追蹤用 request ID：優先 API Gateway requestId，其次 Lambda aws_request_id，最後隨機 UUID。
 def _request_id(event: dict[str, Any], context: Any) -> str:
     request_context = event.get("requestContext")
     if isinstance(request_context, dict) and request_context.get("requestId"):
@@ -145,12 +158,18 @@ def _request_id(event: dict[str, Any], context: Any) -> str:
     return str(aws_request_id or uuid.uuid4())
 
 
+# 解析並嚴格驗證請求 body：
+# 1. （選用）REQUIRE_AUTH_CONTEXT 開啟時，檢查 JWT sub 或 principalId
+# 2. 支援直接呼叫（event 本身就是 body）與 API Gateway（body 為字串，可能經 base64 編碼）
+# 3. 檢查大小、JSON 格式、未知欄位，以及 location / conversationId / text 的格式
+# 回傳 {"conversationId", "text", "location"}。
 def _parse_body(event: dict[str, Any]) -> dict[str, Any]:
     """Parse and strictly validate the public API body."""
 
     if not isinstance(event, dict):
         raise RequestError("INVALID_REQUEST", "請提供有效的 JSON 物件。")
 
+    # 選用的身分檢查：只在經由 API Gateway 呼叫（有 requestContext）時生效。
     if _env_bool("REQUIRE_AUTH_CONTEXT", False) and "requestContext" in event:
         authorizer = (event.get("requestContext") or {}).get("authorizer") or {}
         jwt_claims = (authorizer.get("jwt") or {}).get("claims") or {}
@@ -158,10 +177,12 @@ def _parse_body(event: dict[str, Any]) -> dict[str, Any]:
         if not principal:
             raise RequestError("UNAUTHORIZED", "尚未通過身分驗證。", 401)
 
+    # 沒有 body 但有業務欄位 → 視為直接呼叫（Lambda invoke 或工具呼叫），event 本身就是 body。
     raw_body = event.get("body")
     if raw_body is None and ("text" in event or "location" in event or "conversationId" in event):
         body: Any = event
     else:
+        # API Gateway 可能以 base64 傳送 body：先解碼，再檢查大小與 UTF-8 編碼。
         if event.get("isBase64Encoded") is True:
             try:
                 raw_bytes = base64.b64decode(str(raw_body), validate=True)
@@ -186,11 +207,13 @@ def _parse_body(event: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise RequestError("INVALID_REQUEST", "JSON body 必須是物件。")
 
+    # 欄位白名單；出現其他欄位一律拒絕。
     allowed_keys = {"conversationId", "text", "location"}
     unknown_keys = sorted(set(body) - allowed_keys)
     if unknown_keys:
         raise RequestError("UNKNOWN_FIELD", f"不支援的欄位：{', '.join(unknown_keys)}。")
 
+    # location（選填）：由工具或 API 直接提供已確定的地點，最多 200 字。
     location_value = body.get("location")
     if location_value is not None:
         if not isinstance(location_value, str) or not location_value.strip():
@@ -199,6 +222,8 @@ def _parse_body(event: dict[str, Any]) -> dict[str, Any]:
         if len(location_value) > 200:
             raise RequestError("INVALID_LOCATION", "location 不可超過 200 字。")
 
+    # conversationId 與 location 至少要有一個。
+    # conversationId 可為 null（代表新對話）；有值時必須是標準小寫 UUID 格式。
     if "conversationId" not in body and location_value is None:
         raise RequestError("MISSING_FIELD", "請提供 location。")
     conversation_id = body.get("conversationId")
@@ -212,6 +237,7 @@ def _parse_body(event: dict[str, Any]) -> dict[str, Any]:
         if str(parsed_uuid) != conversation_id.lower():
             raise RequestError("INVALID_CONVERSATION_ID", "conversationId 必須使用標準 UUID 格式。")
 
+    # text：使用者訊息；只提供 location 時以 location 當作 text。不可空白，且不可超過 MAX_TEXT_LENGTH。
     text_value = body.get("text")
     if text_value is None and location_value is not None:
         text_value = location_value
@@ -226,6 +252,7 @@ def _parse_body(event: dict[str, Any]) -> dict[str, Any]:
     return {"conversationId": conversation_id, "text": text_value, "location": location_value}
 
 
+# 以固定關鍵字判斷是否為急症（不分大小寫），會先檢查否定語句。這不是醫療診斷，只用來決定是否跳過一般院所推薦。
 def _contains_emergency(text: str) -> bool:
     lowered = text.casefold()
     if any(term in lowered for term in EMERGENCY_NEGATIONS):
@@ -233,6 +260,7 @@ def _contains_emergency(text: str) -> bool:
     return any(term in lowered for term in EMERGENCY_TERMS)
 
 
+# 規則式地點擷取（Bedrock 關閉或失敗時的備援），例如「我人在東京新宿附近」→「東京新宿」。
 def _heuristic_location(text: str) -> str | None:
     """Conservative fallback for common Chinese and English location phrasing."""
 
@@ -249,6 +277,7 @@ def _heuristic_location(text: str) -> str | None:
     return None
 
 
+# 把模型輸出解析成 JSON 物件：可處理 ```json code fence，或從文字中擷取 {...}；不是物件就回傳 None。
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     text = text.strip()
     if text.startswith("```"):
@@ -267,6 +296,8 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
             return None
 
 
+# 呼叫 Bedrock Converse API，把自然語言轉成 location / insurance / service / is_emergency。
+# system prompt 明確要求把使用者文字視為不可信資料（防 prompt injection）；temperature=0 讓輸出穩定。
 def _bedrock_extract(text: str) -> dict[str, Any] | None:
     model_id = os.getenv("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0")
     client = _aws_client("bedrock-runtime")
@@ -291,6 +322,8 @@ def _bedrock_extract(text: str) -> dict[str, Any] | None:
     return _extract_json_object(output_text)
 
 
+# 先做規則式擷取；ENABLE_BEDROCK_EXTRACTION 開啟時再合併 Bedrock 結果。
+# 模型結果需通過型別與長度檢查才採用；急症判斷只能被模型「升級」，不能「降級」。
 def _extract_query(text: str) -> dict[str, Any]:
     extracted: dict[str, Any] = {
         "location": _heuristic_location(text),
@@ -322,6 +355,7 @@ def _extract_query(text: str) -> dict[str, Any]:
     return extracted
 
 
+# 從 Amazon Location 回應中取出兩碼 ISO 國家代碼（如 JP），相容新版 Places API 與舊版 Place Index 的欄位位置。
 def _country_code_from_result(result: dict[str, Any]) -> str | None:
     address = result.get("Address") or result.get("Place") or {}
     country = address.get("Country") or {}
@@ -336,6 +370,8 @@ def _country_code_from_result(result: dict[str, Any]) -> str | None:
     return None
 
 
+# 地理編碼：地點文字 → {longitude, latitude, countryCode, label}；查無結果回傳 None。
+# GEOCODER_PROVIDER=place_index 使用舊版 Location Place Index；預設 places_v2 使用新版 geo-places API。
 def _geocode(location: str) -> dict[str, Any] | None:
     provider = os.getenv("GEOCODER_PROVIDER", "places_v2").strip().lower()
     if provider == "place_index":
@@ -363,6 +399,7 @@ def _geocode(location: str) -> dict[str, Any] | None:
             "label": str(place.get("Label") or location),
         }
 
+    # 預設：新版 Amazon Location Places API（geo-places）。
     client = _aws_client("geo-places")
     response = client.geocode(
         QueryText=location,
@@ -383,6 +420,7 @@ def _geocode(location: str) -> dict[str, Any] | None:
     }
 
 
+# 把 DynamoDB 回傳的 Decimal 遞迴轉成 int / float，方便後續計算與 JSON 序列化。
 def _ddb_value(value: Any) -> Any:
     if isinstance(value, Decimal):
         return int(value) if value == value.to_integral_value() else float(value)
@@ -393,6 +431,8 @@ def _ddb_value(value: Any) -> Any:
     return value
 
 
+# 以 countryCode（partition key）查詢 FACILITIES_TABLE 的院所。
+# ProjectionExpression 只讀 PUBLIC_FACILITY_FIELDS（用 #f0、#f1… 別名避開保留字）；分頁讀取，最多 MAX_DB_ITEMS 筆。
 def _query_facilities(country_code: str) -> list[dict[str, Any]]:
     table_name = os.getenv("FACILITIES_TABLE", "").strip()
     if not table_name:
@@ -407,6 +447,7 @@ def _query_facilities(country_code: str) -> list[dict[str, Any]]:
     max_items = _env_int("MAX_DB_ITEMS", 500, 1, 5_000)
     last_key: dict[str, Any] | None = None
 
+    # 分頁查詢：每頁最多 100 筆，直到沒有 LastEvaluatedKey 或達到上限。
     while len(items) < max_items:
         kwargs: dict[str, Any] = {
             "KeyConditionExpression": "countryCode = :country",
@@ -425,6 +466,7 @@ def _query_facilities(country_code: str) -> list[dict[str, Any]]:
     return items[:max_items]
 
 
+# Haversine 公式：計算兩組經緯度之間的球面直線距離（公里），地球平均半徑 6371.0088 km。
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     radius = 6_371.0088
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -437,6 +479,7 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return radius * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+# 把 "HH:MM" 解析成 time；格式錯誤回傳 None（呼叫端視為不營業，fail-closed）。
 def _parse_clock(value: str) -> time | None:
     try:
         return time.fromisoformat(value)
@@ -444,6 +487,8 @@ def _parse_clock(value: str) -> time | None:
         return None
 
 
+# 判斷當地時間是否落在單一營業時段內。
+# start == end 代表 24 小時營業；start > end 為跨午夜時段，這裡只處理「當天晚上」那一段。
 def _period_contains(local_dt: datetime, start_value: str, end_value: str) -> bool:
     start = _parse_clock(start_value)
     end = _parse_clock(end_value)
@@ -459,6 +504,7 @@ def _period_contains(local_dt: datetime, start_value: str, end_value: str) -> bo
     return current >= start
 
 
+# 取出某一天的營業時段，統一轉成 [[start, end], ...]；同時接受 "09:00-17:00" 與 ["09:00", "17:00"] 兩種格式。
 def _periods_for_day(hours: Any, day_key: str) -> list[list[str]]:
     if not isinstance(hours, dict):
         return []
@@ -475,6 +521,11 @@ def _periods_for_day(hours: Any, day_key: str) -> list[list[str]]:
     return periods
 
 
+# 判斷院所「現在」是否營業：
+# - 24 小時急診 → 營業
+# - 依院所 IANA 時區換算當地時間；休診日（holidays）→ 不營業
+# - 檢查今天的時段，以及前一天跨夜時段（如 20:00-02:00）延伸到今天凌晨的部分
+# 資料不完整一律視為不營業。
 def _is_open(facility: dict[str, Any], now_utc: datetime) -> bool:
     if facility.get("emergency24h") is True:
         return True
@@ -508,6 +559,8 @@ def _is_open(facility: dict[str, Any], now_utc: datetime) -> bool:
     return False
 
 
+# 保險網絡比對：去除標點、不分大小寫後完全相等才算相符。
+# None = 使用者沒指定保險；True / False = 是否相符（相符不代表保證理賠）。
 def _insurance_matches(requested: str | None, networks: Any) -> bool | None:
     if not requested:
         return None
@@ -517,6 +570,12 @@ def _insurance_matches(requested: str | None, networks: Any) -> bool | None:
     return any(needle == re.sub(r"\W+", "", str(item).casefold()) for item in networks)
 
 
+# 篩選並排序院所：
+# 1. 合作有效：active、partnershipStatus=ACTIVE、validUntil 未過期（格式錯誤 fail-closed）
+# 2. 科別符合（general 不限制）、座標合法、在 SEARCH_RADIUS_KM 半徑內
+# 3. 附上 distanceKm / openNow / insuranceMatched
+# 4. 依設定過濾：INSURANCE_MATCH_REQUIRED（預設關）、OPEN_ONLY（預設開）
+# 5. 排序後取前 MAX_RESULTS 筆
 def _eligible_facilities(
     facilities: Iterable[dict[str, Any]],
     latitude: float,
@@ -564,6 +623,7 @@ def _eligible_facilities(
     if _env_bool("OPEN_ONLY", True):
         results = [item for item in results if item["openNow"] is True]
 
+    # 排序鍵（越小越前面）：營業中 → 保險未明確不符 → 距離近 → priority 高。
     results.sort(
         key=lambda item: (
             not bool(item["openNow"]),
@@ -575,6 +635,7 @@ def _eligible_facilities(
     return results[: _env_int("MAX_RESULTS", DEFAULT_MAX_RESULTS, 1, 10)]
 
 
+# 院所資料輸出前的清理：截斷長度、移除控制字元、< > 轉全形並跳脫 Markdown 符號，防止內容注入。
 def _safe_markdown(value: Any, max_length: int = 300) -> str:
     text_value = str(value or "")[:max_length]
     text_value = "".join(ch for ch in text_value if ch in "\n\t" or ord(ch) >= 32)
@@ -593,6 +654,7 @@ def _safe_markdown(value: Any, max_length: int = 300) -> str:
     return "".join(replacements.get(ch, ch) for ch in text_value).replace("\n", " ").strip()
 
 
+# 依文字中的國家或城市線索選擇緊急電話（日本 119、美加 911、歐洲 112）；無法判斷時不猜號碼。
 def _emergency_number(text: str) -> str:
     lowered = text.casefold()
     if any(place in lowered for place in ("東京", "日本", "japan", "tokyo")):
@@ -604,6 +666,7 @@ def _emergency_number(text: str) -> str:
     return "當地緊急救援電話"
 
 
+# 建立 api/07-chat.md 規定的 ASSISTANT 訊息結構（tasks 固定為空陣列）。
 def _assistant_message(text: str, question: dict[str, Any] | None, timestamp: str) -> dict[str, Any]:
     return {
         "role": "ASSISTANT",
@@ -612,6 +675,7 @@ def _assistant_message(text: str, question: dict[str, Any] | None, timestamp: st
     }
 
 
+# 包裝成功回應 {"data": ...}；conversationId 為 null（新對話）時，產生新的 conversationId 與標題「海外就醫・日期」。
 def _success_payload(
     conversation_id: str | None,
     user_timestamp: str,
@@ -630,6 +694,7 @@ def _success_payload(
     return {"data": data}
 
 
+# 無法取得地點時的追問訊息。
 def _location_question(timestamp: str) -> dict[str, Any]:
     message = _assistant_message(
         "我需要較明確的位置，才能查詢附近的合作院所。",
@@ -642,6 +707,8 @@ def _location_question(timestamp: str) -> dict[str, Any]:
     return message
 
 
+# 把篩選結果轉成前端顯示的 Markdown 文字與追問；查無結果時提供建議與警語。
+# 只輸出名稱、地址、電話、距離、營業狀態與保險相符與否，不輸出 facilityId 或內部資料。
 def _render_facilities(
     facilities: list[dict[str, Any]],
     location_label: str,
@@ -693,6 +760,10 @@ def _render_facilities(
     return "\n".join(lines), question
 
 
+# Lambda 入口，流程：
+# 驗證請求 → 擷取查詢條件 →（急症）直接回覆緊急電話 →（沒有地點）追問 →
+# 地理編碼 → 查詢 DynamoDB → 篩選排序 → 產生 Markdown 回應。
+# stage 記錄目前步驟，發生錯誤時寫入 log 方便排查。
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     request_id = _request_id(event if isinstance(event, dict) else {}, context)
     stage = "parse_request"
@@ -709,6 +780,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             extracted["service"] = "general"
             extracted["is_emergency"] = False
 
+        # 急症短路：不查院所，直接提示撥打緊急電話。
         if extracted["is_emergency"]:
             emergency_number = _emergency_number(request["text"])
             assistant_timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
@@ -727,6 +799,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             LOGGER.info("medical_lookup request_id=%s outcome=emergency", request_id)
             return _response(200, payload)
 
+        # 沒有地點 → 回傳追問（HTTP 仍為 200）。
         location = extracted.get("location")
         if not location:
             assistant_timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
@@ -740,6 +813,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             LOGGER.info("medical_lookup request_id=%s outcome=location_required", request_id)
             return _response(200, payload)
 
+        # 地理編碼失敗或沒有國家代碼 → 請使用者提供更明確的地址。
         stage = "geocode"
         geocoded = _geocode(location)
         if not geocoded or not geocoded.get("countryCode"):
@@ -755,6 +829,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             LOGGER.info("medical_lookup request_id=%s outcome=geocode_not_found", request_id)
             return _response(200, payload)
 
+        # 查詢該國院所 → 篩選排序 → 產生回應文字。
         stage = "query_facilities"
         all_facilities = _query_facilities(geocoded["countryCode"])
         stage = "filter_facilities"
@@ -788,12 +863,14 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         )
         return _response(200, payload)
 
+    # 預期中的驗證錯誤：回傳對應狀態碼與安全訊息。
     except RequestError as exc:
         LOGGER.info("medical_lookup request_id=%s outcome=rejected code=%s", request_id, exc.code)
         return _response(
             exc.status_code,
             {"error": {"code": exc.code, "message": exc.message, "requestId": request_id}},
         )
+    # 非預期錯誤：log 只記錄階段與錯誤代碼，回應通用的 500 訊息。
     except Exception as exc:
         # Never return AWS, table, model, contract or stack details to clients.
         error_response = getattr(exc, "response", None)
